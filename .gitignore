@@ -1,0 +1,82 @@
+# ============================================================
+# Virtual environment
+# ============================================================
+venv/
+env/
+.venv/
+ENV/
+
+# ============================================================
+# Python cache & build artifacts
+# ============================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+
+# ============================================================
+# Model checkpoint (besar — tidak muat di limit 100MB GitHub,
+# dan tidak perlu ikut di-commit karena bisa di-generate ulang
+# dari notebook training / diunduh terpisah)
+# ============================================================
+models/*.pt
+models/*.pth
+models/*.bin
+models/*.safetensors
+
+# ============================================================
+# RAG artifacts (FAISS index & PDF sumber — besar, dan bisa
+# di-generate ulang lewat services/pdf_service.py -> build_sop_index())
+# ============================================================
+rag/*.index
+rag/sop_faiss_index
+rag/sop_faiss.index
+rag/sop_chunks.json
+rag/*.pdf
+
+# ============================================================
+# Secrets — JANGAN pernah commit API key
+# ============================================================
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# ============================================================
+# Folder upload & output runtime (isinya file sementara dari
+# pengguna / hasil generate, bukan bagian dari source code)
+# ============================================================
+uploads/*
+!uploads/.gitkeep
+outputs/*
+!outputs/.gitkeep
+
+# ============================================================
+# Reports (hasil generate otomatis — opsional ikut atau tidak;
+# di-ignore karena berubah setiap kali dijalankan)
+# ============================================================
+reports/*.json
+reports/*.csv
+reports/*.md
+!reports/.gitkeep
+
+# ============================================================
+# OS / editor junk
+# ============================================================
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+
+# ============================================================
+# Jupyter (kalau ada notebook ikut di-commit)
+# ============================================================
+.ipynb_checkpoints/
+
+# ============================================================
+# Logs
+# ============================================================
+*.log
