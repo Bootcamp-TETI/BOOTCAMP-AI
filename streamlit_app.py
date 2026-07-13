@@ -84,7 +84,7 @@ if pre_file and post_file:
     if st.button("Run Full Analysis"):
         result = None
         with st.status("Menjalankan analisis...", expanded=True) as status:
-            status.update(label="📤 Mengirim gambar ke backend (segmentasi + difference map + RAG + Gemini)...")
+            status.update(label="Mengirim gambar ke backend (segmentasi + difference map + RAG + Gemini)...")
             try:
                 resp = requests.post(
                     f"{API_URL}/analyze",
