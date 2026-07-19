@@ -56,12 +56,31 @@ class RagService:
         context = "\n".join(f"- {chunk}" for chunk, _score in retrieved)
 
         prompt = f"""
-Anda adalah analis triase bencana AI. Buat laporan penilaian kerusakan singkat dalam Bahasa Indonesia.
+Anda adalah analis triase bencana. Tulis laporan penilaian kerusakan dalam Bahasa Indonesia,
+format Markdown, MENGIKUTI PERSIS struktur berikut (jangan tambah bagian lain, tanpa sapaan/penutup):
 
-ATURAN:
-1. Semua angka HARUS berasal dari JSON di bawah. Jangan mengarang angka.
-2. Gunakan KONTEKS SOP di bawah untuk mendasari rekomendasi Anda.
-3. Sebutkan recommended_action, evacuation_radius_km, dan required_logistics secara eksplisit.
+### Ringkasan Eksekutif
+2-3 kalimat lugas: tingkat keparahan, status prioritas, dan tindakan paling mendesak.
+
+### Situasi Lapangan
+4-6 bullet berisi angka kunci (persentase kerusakan, jumlah bangunan rusak/aman, estimasi luas,
+prioritas). Cetak tebal angka pentingnya.
+
+### Rekomendasi Tindakan
+Daftar bernomor 3-5 poin, urut dari paling mendesak. Tiap poin actionable (siapa melakukan apa)
+dan bila relevan sebutkan singkat dasar SOP-nya dari konteks di bawah.
+
+### Evakuasi & Logistik
+Sebutkan eksplisit recommended_action, radius evakuasi (evacuation_radius_km), dan seluruh
+required_logistics dari data.
+
+> Catatan: estimasi otomatis dari citra satelit — wajib diverifikasi tim lapangan sebelum
+> menjadi dasar keputusan operasional.
+
+ATURAN KERAS:
+1. SEMUA angka HARUS berasal dari JSON DATA di bawah — jangan mengarang atau membulatkan berlebihan.
+2. Rekomendasi harus berpijak pada KONTEKS SOP di bawah, bukan pengetahuan umum semata.
+3. Maksimal ±250 kata, bahasa lugas untuk pembaca posko (bukan akademik).
 
 KONTEKS SOP (hasil retrieval FAISS):
 {context}

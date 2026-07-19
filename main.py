@@ -86,27 +86,38 @@ def _encode_png_base64(arr: np.ndarray) -> str:
     return base64.b64encode(buf.tobytes()).decode("utf-8")
 
 
-def _mask_to_visual(mask: np.ndarray) -> np.ndarray:
-    """Ubah mask biner (0/1) menjadi gambar hitam-putih yang enak dilihat."""
-    return (mask * 255).astype(np.uint8)
-
-
-def _diff_to_visual(diff: np.ndarray) -> np.ndarray:
-    """Ubah difference map (0=background, 1=utuh, 2=rusak) menjadi gambar BGR berwarna."""
-    vis = np.zeros((*diff.shape, 3), dtype=np.uint8)
-    vis[diff == 1] = (0, 255, 0)   # hijau = bangunan utuh
-    vis[diff == 2] = (0, 0, 255)   # merah = bangunan rusak (OpenCV pakai urutan BGR)
+def _mask_overlay(img_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Overlay mask bangunan (kuning) di atas citra aslinya — jauh lebih terbaca
+    daripada mask mentah hitam-putih."""
+    vis = img_bgr.copy()
+    m = mask.astype(bool)
+    vis[m] = (0.4 * vis[m] + 0.6 * np.array((0, 220, 255))).astype(np.uint8)  # BGR kuning
     return vis
 
 
-def _count_buildings(binary_mask: np.ndarray, min_area_px: int = 20) -> int:
-    """Hitung jumlah komponen terhubung sebagai proxy jumlah bangunan pada mask biner.
-    Ini estimasi kasar (connected components), bukan instance segmentation sungguhan.
-    Blob lebih kecil dari min_area_px diabaikan supaya noise beberapa piksel
-    tidak ikut terhitung sebagai bangunan."""
-    n_labels, _, comp_stats, _ = cv2.connectedComponentsWithStats(binary_mask.astype(np.uint8))
-    # baris 0 = background; kolom cv2.CC_STAT_AREA = luas blob dalam piksel
-    return int(np.sum(comp_stats[1:, cv2.CC_STAT_AREA] >= min_area_px))
+def _diff_overlay(post_bgr: np.ndarray, diff: np.ndarray) -> np.ndarray:
+    """Overlay difference map di atas citra post: hijau = utuh, merah = rusak/hilang."""
+    vis = post_bgr.copy()
+    utuh, rusak = diff == 1, diff == 2
+    vis[utuh] = (0.45 * vis[utuh] + 0.55 * np.array((80, 220, 80))).astype(np.uint8)
+    vis[rusak] = (0.35 * vis[rusak] + 0.65 * np.array((60, 60, 255))).astype(np.uint8)
+    return vis
+
+
+def _building_counts(mask_pre: np.ndarray, diff: np.ndarray,
+                     min_area_px: int = 20, min_damage_px: int = 10):
+    """Hitung (total, rusak) bangunan dari komponen terhubung mask pre.
+    Bangunan = blob mask_pre >= min_area_px (filter noise). Bangunan dihitung RUSAK
+    kalau blob itu kehilangan >= min_damage_px piksel di difference map — dengan cara
+    ini 'rusak' selalu subset dari 'total' (satu bangunan yang pecah jadi beberapa
+    blob kerusakan tidak dihitung berkali-kali)."""
+    n_labels, labels_img, comp_stats, _ = cv2.connectedComponentsWithStats(mask_pre.astype(np.uint8))
+    valid = comp_stats[:, cv2.CC_STAT_AREA] >= min_area_px
+    valid[0] = False  # index 0 = background
+    damaged_ids, damage_px = np.unique(labels_img[diff == 2], return_counts=True)
+    n_damaged = sum(1 for i, c in zip(damaged_ids, damage_px)
+                    if i != 0 and valid[i] and c >= min_damage_px)
+    return int(valid.sum()), int(n_damaged)
 
 
 # ----------------------------------------------------------------------
@@ -120,6 +131,7 @@ async def analyze(
     disaster_type: str = Form(None),
     center_lat: float = Form(None),
     center_lon: float = Form(None),
+    gsd: float = Form(None),
 ):
     request_start = time.time()
     logger.info("Request diterima: pre=%s, post=%s", pre_image.filename, post_image.filename)
@@ -168,17 +180,18 @@ async def analyze(
         return JSONResponse(status_code=500, content={"error": f"Model inference gagal: {e}"})
 
     # --- 3) Enrich stats: estimasi jumlah bangunan & luas area ---
+    # GSD per-request (mis. dari metadata label xBD) menang atas default env.
+    gsd_eff = gsd if gsd and gsd > 0 else GSD_METERS_PER_PIXEL
     try:
-        n_total_buildings = _count_buildings(mask_pre)
-        n_damaged_buildings = _count_buildings((diff == 2).astype(np.uint8))
-        n_safe_buildings = max(n_total_buildings - n_damaged_buildings, 0)
-        area_m2 = round(stats.get("total_building_pixels", 0) * (GSD_METERS_PER_PIXEL ** 2), 1)
+        n_total_buildings, n_damaged_buildings = _building_counts(mask_pre, diff)
+        n_safe_buildings = n_total_buildings - n_damaged_buildings
+        area_m2 = round(stats.get("total_building_pixels", 0) * (gsd_eff ** 2), 1)
         stats.update({
             "buildings_total": n_total_buildings,
             "buildings_damaged": n_damaged_buildings,
             "buildings_safe": n_safe_buildings,
             "area_m2": area_m2,
-            "gsd_meters_per_pixel": GSD_METERS_PER_PIXEL,
+            "gsd_meters_per_pixel": gsd_eff,
         })
     except Exception as e:
         logger.warning("Gagal menghitung estimasi jumlah bangunan/area (non-fatal): %s", e)
@@ -197,12 +210,12 @@ async def analyze(
         locations = []
         for cx, cy, area_px in blobs[:100]:
             item = {"pixel_x": int(cx), "pixel_y": int(cy),
-                    "area_m2": round(area_px * GSD_METERS_PER_PIXEL ** 2, 1)}
+                    "area_m2": round(area_px * gsd_eff ** 2, 1)}
             if center_lat is not None and center_lon is not None:
                 # Konversi piksel -> lat/lon: aproksimasi equirectangular di sekitar pusat citra.
                 # Cukup akurat untuk area kecil (beberapa km); bukan pengganti georeference GeoTIFF asli.
-                dy_m = (cy - h / 2) * GSD_METERS_PER_PIXEL
-                dx_m = (cx - w / 2) * GSD_METERS_PER_PIXEL
+                dy_m = (cy - h / 2) * gsd_eff
+                dx_m = (cx - w / 2) * gsd_eff
                 item["lat"] = round(center_lat - dy_m / 111320.0, 6)
                 item["lon"] = round(center_lon + dx_m / (111320.0 * max(float(np.cos(np.radians(center_lat))), 1e-6)), 6)
             locations.append(item)
@@ -218,7 +231,18 @@ async def analyze(
             report_text, retrieved = rag_service.generate_report(stats)
             rag_time = round(time.time() - t0, 2)
             stats["ai_report"] = report_text
-            stats["rag_sources_used"] = [chunk[:120] for chunk, _score in retrieved]
+            def _tidy_chunk(chunk: str, max_len: int = 220) -> str:
+                """Rapikan chunk untuk ditampilkan: buang pecahan kata di awal, potong di batas kata."""
+                text = " ".join(chunk.split())
+                if text and text[0].islower() and " " in text:
+                    text = "..." + text[text.find(" "):]
+                if len(text) > max_len:
+                    text = text[:max_len].rsplit(" ", 1)[0] + "..."
+                return text
+
+            stats["rag_sources_used"] = [
+                {"text": _tidy_chunk(chunk), "score": round(score, 3)} for chunk, score in retrieved
+            ]
             logger.info("RAG + Gemini report selesai dalam %.2fs", rag_time)
         except Exception as e:
             logger.exception("RAG/Gemini report gagal (non-fatal, analisis CV tetap dikembalikan)")
@@ -235,8 +259,9 @@ async def analyze(
         "total_seconds": total_time,
     }
     stats["confidence_note"] = (
-        "confidence = rata-rata probabilitas softmax model pada piksel citra post-disaster "
-        "yang diprediksi sebagai 'building' (bukan angka tetap)."
+        "confidence = rata-rata probabilitas softmax (TTA 3-arah: asli + flip H/V) pada piksel "
+        "interior bangunan citra post-disaster — piksel tepi dikecualikan karena ketidakpastian "
+        "batas adalah sifat bawaan segmentasi. Bukan angka akurasi model (lihat mIoU/Dice validasi)."
     )
     logger.info("Request selesai dalam %.2fs (model=%.2fs, rag=%s)", total_time, model_time, rag_time)
 
@@ -244,9 +269,9 @@ async def analyze(
     try:
         payload = {
             "stats": stats,
-            "mask_pre": _encode_png_base64(_mask_to_visual(mask_pre)),
-            "mask_post": _encode_png_base64(_mask_to_visual(mask_post)),
-            "difference_map": _encode_png_base64(_diff_to_visual(diff)),
+            "mask_pre": _encode_png_base64(_mask_overlay(pre_bgr, mask_pre)),
+            "mask_post": _encode_png_base64(_mask_overlay(post_bgr, mask_post)),
+            "difference_map": _encode_png_base64(_diff_overlay(post_bgr, diff)),
         }
     except Exception as e:
         logger.exception("Gagal encode gambar hasil ke base64")

@@ -1,10 +1,15 @@
+# Torch versi CPU (server deploy tidak ber-GPU; wheel CUDA ~2.5GB kebesaran).
+# Paket selain torch otomatis jatuh ke PyPI lewat extra-index-url.
+--index-url https://download.pytorch.org/whl/cpu
+--extra-index-url https://pypi.org/simple
+
 # Backend (FastAPI)
 fastapi
 uvicorn
 python-multipart
 python-dotenv
 numpy
-opencv-python
+opencv-python-headless
 torch
 transformers
 albumentations

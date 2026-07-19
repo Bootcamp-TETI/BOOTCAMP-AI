@@ -54,13 +54,27 @@ class ModelService:
                         tile = cv2.copyMakeBorder(tile, 0, tile_size-th, 0, tile_size-tw,
                                                    cv2.BORDER_CONSTANT, value=0)
                     inp = self.transform(image=tile)['image'].unsqueeze(0).to(self.device)
-                    out = self.model(pixel_values=inp)
-                    logits = nn.functional.interpolate(out.logits, size=(tile_size, tile_size),
-                                                        mode="bilinear", align_corners=False)
-                    probs = torch.softmax(logits, dim=1)[0, 1].cpu().numpy()
-                    pred = logits.argmax(dim=1).squeeze().cpu().numpy().astype(np.uint8)
+                    # Test-time augmentation: rata-rata probabilitas dari citra asli + flip
+                    # horizontal + flip vertikal — prediksi lebih stabil, confidence lebih terukur.
+                    probs_sum = None
+                    for flip_dims in (None, [3], [2]):
+                        x_in = torch.flip(inp, flip_dims) if flip_dims else inp
+                        out = self.model(pixel_values=x_in)
+                        logits = nn.functional.interpolate(out.logits, size=(tile_size, tile_size),
+                                                            mode="bilinear", align_corners=False)
+                        p = torch.softmax(logits, dim=1)
+                        if flip_dims:
+                            p = torch.flip(p, flip_dims)
+                        probs_sum = p if probs_sum is None else probs_sum + p
+                    probs_avg = (probs_sum / 3)[0]
+                    probs = probs_avg[1].cpu().numpy()
+                    pred = probs_avg.argmax(dim=0).cpu().numpy().astype(np.uint8)
                     full_mask[y:y+th, x:x+tw] = pred[:th, :tw]
-                    bp = probs[:th, :tw][pred[:th, :tw] == 1]
+                    # Confidence dihitung pada piksel INTERIOR bangunan (tepi dierosi 1px):
+                    # ketidakpastian di batas objek adalah sifat bawaan segmentasi, bukan
+                    # ukuran keyakinan model terhadap bangunannya sendiri.
+                    interior = cv2.erode(pred, np.ones((3, 3), np.uint8))
+                    bp = probs[:th, :tw][interior[:th, :tw] == 1]
                     if bp.size:
                         conf_values.append(bp)
         mean_conf = float(np.concatenate(conf_values).mean()) if conf_values else 0.0
@@ -77,7 +91,7 @@ class ModelService:
         pre_rgb = cv2.cvtColor(pre_bgr, cv2.COLOR_BGR2RGB)
         post_rgb = cv2.cvtColor(post_bgr, cv2.COLOR_BGR2RGB)
 
-        mask_pre, _ = self._predict_tile_grid(pre_rgb)
+        mask_pre, conf_pre = self._predict_tile_grid(pre_rgb)
         mask_post, conf_post = self._predict_tile_grid(post_rgb)
 
         diff = np.zeros_like(mask_pre, dtype=np.uint8)
@@ -99,6 +113,7 @@ class ModelService:
             "triage_score": score,
             "priority": bucket.upper(),
             "confidence": round(conf_post, 3),
+            "confidence_pre": round(conf_pre, 3),
             "recommended_action": ds["recommended_action"],
             "evacuation_radius_km": ds["evacuation_radius_km"],
             "required_logistics": ds["required_logistics"],

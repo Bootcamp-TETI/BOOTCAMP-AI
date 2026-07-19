@@ -1,0 +1,5 @@
+{
+  "embed_model": "gemini-embedding-001",
+  "dim": 3072,
+  "chunks": 460
+}

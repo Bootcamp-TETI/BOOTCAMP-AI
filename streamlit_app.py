@@ -3,6 +3,8 @@ import hashlib
 import io
 import json
 import os
+import re
+from datetime import datetime
 
 import requests
 import streamlit as st
@@ -10,6 +12,7 @@ from PIL import Image
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas as rl_canvas
+from reportlab.lib.colors import HexColor
 
 # WAJIB jadi command Streamlit pertama — bahkan akses st.secrets di bawah pun dihitung command.
 st.set_page_config(page_title="Post-Disaster Damage Assessment", layout="wide")
@@ -86,7 +89,42 @@ def get_api_url() -> str:
 
 API_URL = get_api_url()
 PRIORITY_COLOR = {"GREEN": "🟢", "YELLOW": "🟡", "ORANGE": "🟠", "RED": "🔴"}
-SAMPLE_PRE, SAMPLE_POST = "pre_resized.png", "post_resized.png"
+# Koordinat & GSD sample Palu diambil dari label xBD asli (polygon lng_lat) —
+# bukan geocoding, jadi titik bangunan rusaknya akurat secara geografis.
+SAMPLES = {
+    "palu": {"pre": "sample_palu_pre.png", "post": "sample_palu_post.png",
+             "coords": (-0.820928, 119.879618), "gsd": 0.495},
+    "aceh": {"pre": "pre_resized.png", "post": "post_resized.png",
+             "coords": None, "gsd": None},
+}
+
+@st.cache_resource(show_spinner=False)
+def ensure_backend():
+    """Jalankan backend FastAPI sebagai subprocess bila belum ada yang listen di port 8000.
+    Dipakai di deployment satu-proses (Streamlit Community Cloud); secara lokal, kalau
+    uvicorn sudah dijalankan manual, fungsi ini tidak melakukan apa-apa."""
+    import socket
+    import subprocess
+    import sys
+    try:
+        with socket.create_connection(("localhost", 8000), timeout=0.4):
+            return "sudah jalan"
+    except OSError:
+        pass
+    env = dict(os.environ)
+    try:
+        # Streamlit Cloud menaruh secrets di st.secrets, bukan env var — teruskan ke subprocess.
+        if "GOOGLE_API_KEY" in st.secrets:
+            env["GOOGLE_API_KEY"] = st.secrets["GOOGLE_API_KEY"]
+    except Exception:
+        pass
+    subprocess.Popen([sys.executable, "-m", "uvicorn", "main:app",
+                      "--host", "0.0.0.0", "--port", "8000"], env=env)
+    return "dispawn"
+
+
+if "localhost" in API_URL:
+    ensure_backend()
 
 st.title("Post-Disaster Damage Assessment & Triage Dashboard")
 
@@ -139,6 +177,40 @@ def input_digest(pre: bytes, post: bytes) -> str:
     return hashlib.md5(pre + post).hexdigest()
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def geocode_place(place: str):
+    """Nama tempat -> (lat, lon) via Nominatim/OpenStreetMap — gratis, tanpa API key.
+    Di-cache 1 jam supaya tidak menembak API di setiap rerun Streamlit."""
+    try:
+        r = requests.get("https://nominatim.openstreetmap.org/search",
+                         params={"q": place, "format": "json", "limit": 1, "countrycodes": "id"},
+                         headers={"User-Agent": "post-disaster-damage-assessment/1.0"}, timeout=6)
+        data = r.json()
+        if data:
+            return float(data[0]["lat"]), float(data[0]["lon"])
+    except Exception:
+        pass
+    return None
+
+
+def exif_gps(img_bytes: bytes):
+    """Baca koordinat GPS dari metadata EXIF (umumnya ada di foto kamera/drone;
+    citra satelit PNG seperti xBD tidak punya — fallback ke input manual)."""
+    try:
+        exif = Image.open(io.BytesIO(img_bytes))._getexif()
+        gps = exif.get(34853) if exif else None  # 34853 = tag GPSInfo
+        if not gps or 2 not in gps or 4 not in gps:
+            return None
+
+        def to_deg(vals, ref):
+            deg = float(vals[0]) + float(vals[1]) / 60 + float(vals[2]) / 3600
+            return -deg if ref in ("S", "W") else deg
+
+        return to_deg(gps[2], gps.get(1, "N")), to_deg(gps[4], gps.get(3, "E"))
+    except Exception:
+        return None
+
+
 # 1) Upload
 st.header("Upload Pre & Post Disaster Images")
 col1, col2 = st.columns(2)
@@ -147,19 +219,31 @@ with col1:
 with col2:
     post_file = st.file_uploader("Post-disaster image", type=["png", "jpg", "jpeg"], key="post")
 
-# Tombol data contoh — pakai pasangan citra Palu yang sudah ada di repo,
-# supaya orang bisa langsung mencoba tanpa harus mencari citra pre/post sendiri.
-if os.path.exists(SAMPLE_PRE) and os.path.exists(SAMPLE_POST):
-    if st.button("🧪 Coba dengan data contoh (Aceh 2004 — demo alur, di luar domain training)"):
-        with open(SAMPLE_PRE, "rb") as f:
-            st.session_state["pre_bytes"] = f.read()
-        with open(SAMPLE_POST, "rb") as f:
-            st.session_state["post_bytes"] = f.read()
+# Tombol data contoh — supaya orang bisa langsung mencoba tanpa mencari citra sendiri.
+def load_sample(key: str):
+    meta = SAMPLES[key]
+    with open(meta["pre"], "rb") as f:
+        st.session_state["pre_bytes"] = f.read()
+    with open(meta["post"], "rb") as f:
+        st.session_state["post_bytes"] = f.read()
+    st.session_state["sample_meta"] = meta
+
+
+sb1, sb2 = st.columns(2)
+if os.path.exists(SAMPLES["palu"]["pre"]) and os.path.exists(SAMPLES["palu"]["post"]):
+    if sb1.button("🛰️ Data contoh: Palu Tsunami 2018 (xBD asli — sesuai domain training)",
+                  use_container_width=True):
+        load_sample("palu")
+if os.path.exists(SAMPLES["aceh"]["pre"]) and os.path.exists(SAMPLES["aceh"]["post"]):
+    if sb2.button("🧪 Data contoh: Aceh 2004 (foto internet — hanya demo alur)",
+                  use_container_width=True):
+        load_sample("aceh")
 
 # Upload user menimpa data contoh
 if pre_file and post_file:
     st.session_state["pre_bytes"] = pre_file.getvalue()
     st.session_state["post_bytes"] = post_file.getvalue()
+    st.session_state.pop("sample_meta", None)  # metadata sample tidak berlaku untuk upload sendiri
 
 pre_bytes = st.session_state.get("pre_bytes")
 post_bytes = st.session_state.get("post_bytes")
@@ -188,9 +272,27 @@ if pre_bytes and post_bytes:
     location = cc1.text_input("Lokasi", placeholder="Palu, Sulawesi Tengah")
     disaster_type = cc2.selectbox("Jenis bencana",
                                   ["", "Tsunami", "Gempa bumi", "Banjir", "Tanah longsor", "Erupsi gunung api", "Lainnya"])
-    center_lat = cc3.text_input("Latitude pusat citra", placeholder="-0.8917")
-    center_lon = cc4.text_input("Longitude pusat citra", placeholder="119.8707")
-    st.caption("Isi lat/lon pusat citra untuk mendapatkan koordinat GPS tiap bangunan rusak + GeoJSON untuk tim lapangan.")
+    # Koordinat diisi otomatis, urut akurasi: metadata sample xBD > EXIF gambar > geocode nama lokasi.
+    # Field manual tetap ada sebagai override.
+    sample_meta = st.session_state.get("sample_meta") or {}
+    gps, gps_src = None, None
+    if sample_meta.get("coords"):
+        gps, gps_src = sample_meta["coords"], "georeference label xBD (akurat)"
+    if not gps:
+        gps, gps_src = exif_gps(post_bytes) or exif_gps(pre_bytes), "metadata EXIF gambar"
+    if not gps and location:
+        gps, gps_src = geocode_place(location), (f'nama lokasi "{location}" via OpenStreetMap — '
+                                                 "perkiraan pusat wilayah, titik bangunan akurat "
+                                                 "secara RELATIF saja")
+    center_lat = cc3.text_input("Latitude pusat citra",
+                                value=(f"{gps[0]:.6f}" if gps else ""), placeholder="-0.8917")
+    center_lon = cc4.text_input("Longitude pusat citra",
+                                value=(f"{gps[1]:.6f}" if gps else ""), placeholder="119.8707")
+    if gps:
+        st.caption(f"📍 Koordinat terisi otomatis dari {gps_src} — silakan koreksi bila perlu.")
+    else:
+        st.caption("Ketik nama lokasi di kolom pertama — koordinat terisi otomatis. "
+                   "(Atau isi lat/lon manual.)")
 
     if st.button("Run Full Analysis", type="primary", use_container_width=True):
         form_data = {}
@@ -203,6 +305,8 @@ if pre_bytes and post_bytes:
             form_data["center_lon"] = float(center_lon)
         except ValueError:
             pass  # lat/lon kosong/tidak valid — analisis tetap jalan tanpa koordinat
+        if sample_meta.get("gsd"):
+            form_data["gsd"] = sample_meta["gsd"]
 
         with st.status("Menjalankan analisis...", expanded=True) as status:
             status.update(label="Mengirim gambar ke backend (segmentasi + difference map + RAG + Gemini)...")
@@ -259,17 +363,17 @@ if pre_bytes and post_bytes:
         st.header("Segmentation Result")
         s1, s2 = st.columns(2)
         if "mask_pre" in result:
-            s1.image(b64_to_bytes(result["mask_pre"]), caption="Predicted Mask — Pre-disaster",
+            s1.image(b64_to_bytes(result["mask_pre"]), caption="Segmentasi Bangunan — Pre-disaster (kuning = bangunan terdeteksi)",
                       use_container_width=True)
         if "mask_post" in result:
-            s2.image(b64_to_bytes(result["mask_post"]), caption="Predicted Mask — Post-disaster",
+            s2.image(b64_to_bytes(result["mask_post"]), caption="Segmentasi Bangunan — Post-disaster (kuning = bangunan terdeteksi)",
                       use_container_width=True)
 
         # 4) Difference Map
         st.header("Difference Map")
         if "difference_map" in result:
             st.image(b64_to_bytes(result["difference_map"]), caption="Difference Map", width=500)
-        st.caption("🟩 Hijau = bangunan utuh · 🟥 Merah = bangunan rusak/hilang · Hitam = bukan bangunan")
+        st.caption("🟩 Hijau = bangunan utuh · 🟥 Merah = bangunan rusak/hilang — di-overlay langsung di atas citra post-disaster")
 
         # 5) Statistics
         st.header("Statistics")
@@ -284,13 +388,27 @@ if pre_bytes and post_bytes:
                     if isinstance(stats.get("area_m2"), (int, float)) else "N/A")
         colF.metric("Damaged Pixels", f"{stats['damaged_pixels']:,}")
         confidence_pct = f"{stats['confidence']*100:.1f}%" if stats.get("confidence") is not None else "N/A"
-        colG.metric("Model Confidence", confidence_pct,
-                    help=stats.get("confidence_note", "Rata-rata probabilitas softmax model."))
+        conf_main = (f"{stats['confidence_pre']*100:.1f}%"
+                     if stats.get("confidence_pre") is not None else confidence_pct)
+        conf_delta = None
+        if stats.get("confidence") is not None and stats.get("confidence_pre") is not None:
+            conf_delta = f"{(stats['confidence'] - stats['confidence_pre']) * 100:.1f}% pada citra post"
+        colG.metric("Keyakinan Segmentasi", conf_main, delta=conf_delta,
+                    help="Rata-rata probabilitas softmax (TTA 3-arah, piksel interior bangunan) pada citra "
+                         "PRE — mengukur kemampuan model mengenali bangunan di wilayah ini. Penurunan pada "
+                         "citra post BUKAN penurunan kualitas model, melainkan indikasi bangunan hancur "
+                         "(puing tidak lagi dikenali sebagai bangunan).")
+        st.caption("Akurasi model pada set validasi (xBD Palu): **mIoU 79.9% · Dice 82.9% · Building IoU 70.7%**")
 
-        # 6) Priority Score
+        # 6) Priority Score — badge ala shadcn
         st.header("Priority Score")
-        emoji = PRIORITY_COLOR.get(stats["priority"], "⚪")
-        st.markdown(f"### {emoji} Priority: **{stats['priority']}**")
+        PRIORITY_STYLE = {"GREEN": ("#16a34a", "#f0fdf4"), "YELLOW": ("#ca8a04", "#fefce8"),
+                          "ORANGE": ("#ea580c", "#fff7ed"), "RED": ("#dc2626", "#fef2f2")}
+        pc, pbg = PRIORITY_STYLE.get(stats["priority"], ("#71717a", "#fafafa"))
+        st.markdown(f'<span style="background:{pbg};color:{pc};border:1px solid {pc}40;'
+                    f'padding:8px 18px;border-radius:9999px;font-weight:600;font-size:1.1rem;">'
+                    f'&#9679;&nbsp; {stats["priority"]} &nbsp;&middot;&nbsp; '
+                    f'{stats["damage_percentage"]}% kerusakan</span>', unsafe_allow_html=True)
 
         # 7) Decision Support
         st.header("Decision Support")
@@ -304,12 +422,44 @@ if pre_bytes and post_bytes:
         locs = stats.get("damaged_building_locations", [])
         if locs:
             import pandas as pd
+            import pydeck as pdk
             st.header("Titik Bangunan Rusak (untuk tim lapangan)")
             df_loc = pd.DataFrame(locs)
             has_coords = "lat" in df_loc.columns
             if has_coords:
-                st.map(df_loc[["lat", "lon"]])
-            st.caption("Diurutkan dari kerusakan terluas — prioritas kunjungan tim lapangan.")
+                df_map = df_loc.copy()
+                df_map["rank"] = range(1, len(df_map) + 1)
+                # radius titik proporsional akar luas kerusakan (meter), minimal 6 m biar terlihat
+                df_map["radius"] = (df_map["area_m2"] ** 0.5).clip(lower=6)
+                c_lat, c_lon = float(df_map["lat"].mean()), float(df_map["lon"].mean())
+                layers = []
+                evac_km = stats.get("evacuation_radius_km") or 0
+                if evac_km:
+                    layers.append(pdk.Layer(
+                        "ScatterplotLayer",
+                        data=[{"lat": c_lat, "lon": c_lon}],
+                        get_position="[lon, lat]", get_radius=evac_km * 1000,
+                        get_fill_color=[249, 115, 22, 22], get_line_color=[234, 88, 12, 170],
+                        stroked=True, line_width_min_pixels=2,
+                    ))
+                layers.append(pdk.Layer(
+                    "ScatterplotLayer",
+                    data=df_map,
+                    get_position="[lon, lat]", get_radius="radius",
+                    get_fill_color=[220, 38, 38, 185], get_line_color=[127, 29, 29],
+                    stroked=True, line_width_min_pixels=1, pickable=True,
+                ))
+                st.pydeck_chart(pdk.Deck(
+                    map_style=None,
+                    initial_view_state=pdk.ViewState(latitude=c_lat, longitude=c_lon, zoom=15),
+                    layers=layers,
+                    tooltip={"html": "<b>Bangunan rusak #{rank}</b><br/>Luas ~{area_m2} m2<br/>{lat}, {lon}",
+                             "style": {"backgroundColor": "#18181b", "color": "#fafafa",
+                                       "fontSize": "12px", "borderRadius": "6px"}},
+                ))
+                st.caption("🔴 Titik = bangunan rusak (besar titik ∝ luas kerusakan, hover untuk detail) · "
+                           "🟠 Lingkaran = radius evakuasi dari pusat area terdampak")
+            st.caption("Tabel diurutkan dari kerusakan terluas — prioritas kunjungan tim lapangan.")
             st.dataframe(df_loc, use_container_width=True, height=240)
             if has_coords:
                 geojson = {
@@ -352,82 +502,165 @@ if pre_bytes and post_bytes:
 
         # 8) AI Report
         st.header("AI Report (RAG-Grounded)")
-        st.markdown(stats.get("ai_report", "Report not available."))
+        with st.container(border=True):
+            st.markdown(stats.get("ai_report", "Report not available."))
         with st.expander("Lihat sumber SOP yang digunakan (RAG retrieval)"):
-            for src in stats.get("rag_sources_used", []):
-                st.markdown(f"- {src}...")
+            st.caption("Potongan dokumen SOP BNPB/BPBD yang paling relevan hasil pencarian FAISS — "
+                       "dasar (grounding) laporan AI di atas.")
+            for i, src in enumerate(stats.get("rag_sources_used", []), 1):
+                if isinstance(src, dict):
+                    st.markdown(f"**Sumber {i}** · similarity `{src.get('score', '?')}`")
+                    st.markdown(f"> {src.get('text', '')}")
+                else:
+                    st.markdown(f"- {src}...")
 
         # 9) Download PDF
         st.header("Download PDF")
 
         def build_pdf_with_images():
+            ZINC900 = HexColor("#18181b")
+            ZINC500 = HexColor("#71717a")
+            ZINC300 = HexColor("#a1a1aa")
+            ZINC200 = HexColor("#e4e4e7")
+            WHITE = HexColor("#ffffff")
+            PRIO_COL = {"GREEN": HexColor("#16a34a"), "YELLOW": HexColor("#ca8a04"),
+                        "ORANGE": HexColor("#ea580c"), "RED": HexColor("#dc2626")}
+
             buf = io.BytesIO()
             c = rl_canvas.Canvas(buf, pagesize=A4)
-            width, height = A4
-            y = height - 50
+            W, H = A4
+            M = 40
+            page_state = {"n": 0}
 
-            c.setFont("Helvetica-Bold", 14)
-            c.drawString(50, y, "Laporan Penilaian Kerusakan Pasca-Bencana")
-            y -= 25
-            c.setFont("Helvetica", 10)
-            for line in [
-                f"Priority: {stats['priority']} ({stats['damage_percentage']}%)",
-                f"Bangunan: {stats.get('buildings_total', 'N/A')} total, "
-                f"{stats.get('buildings_damaged', 'N/A')} rusak, {stats.get('buildings_safe', 'N/A')} aman",
-                f"Estimasi luas area: {stats.get('area_m2', 'N/A')} m²",
-                f"Recommended Action: {stats['recommended_action']}",
-                f"Evacuation Radius: {stats['evacuation_radius_km']} km",
-                f"Confidence: {confidence_pct}",
-            ]:
-                c.drawString(50, y, line)
-                y -= 14
-            y -= 10
-
-            # Gambar: pre, post, mask_pre, mask_post, difference map
-            images_to_embed = [
-                ("Pre-disaster", pre_bytes),
-                ("Post-disaster", post_bytes),
-                ("Predicted Mask (Pre)", b64_to_bytes(result["mask_pre"])) if "mask_pre" in result else None,
-                ("Predicted Mask (Post)", b64_to_bytes(result["mask_post"])) if "mask_post" in result else None,
-                ("Difference Map", b64_to_bytes(result["difference_map"])) if "difference_map" in result else None,
-            ]
-            images_to_embed = [im for im in images_to_embed if im is not None]
-
-            img_w, img_h = 240, 180
-            x_positions = [50, 50 + img_w + 20]
-            x_idx = 0
-            for label, img_bytes in images_to_embed:
-                if y - img_h < 60:
+            def new_page(suffix=""):
+                if page_state["n"] > 0:
                     c.showPage()
-                    y = height - 50
-                    x_idx = 0
-                x = x_positions[x_idx % 2]
-                try:
-                    c.drawImage(ImageReader(io.BytesIO(img_bytes)), x, y - img_h,
-                                width=img_w, height=img_h, preserveAspectRatio=True, anchor='c')
-                    c.setFont("Helvetica", 8)
-                    c.drawString(x, y - img_h - 12, label)
-                except Exception:
-                    c.drawString(x, y - 12, f"[Gagal render gambar: {label}]")
-                x_idx += 1
-                if x_idx % 2 == 0:
-                    y -= img_h + 30
+                page_state["n"] += 1
+                c.setFillColor(ZINC900)
+                c.rect(0, H - 70, W, 70, fill=1, stroke=0)
+                c.setFillColor(WHITE)
+                c.setFont("Helvetica-Bold", 14)
+                c.drawString(M, H - 36, "Laporan Penilaian Kerusakan Pasca-Bencana" + suffix)
+                sub = "  |  ".join(str(x) for x in [stats.get("disaster_type"), stats.get("location"),
+                                                    datetime.now().strftime("%d %b %Y %H:%M")] if x)
+                c.setFillColor(ZINC300)
+                c.setFont("Helvetica", 8.5)
+                c.drawString(M, H - 52, sub)
+                label = f"{stats['priority']}  {stats['damage_percentage']}%"
+                bw = c.stringWidth(label, "Helvetica-Bold", 10) + 22
+                c.setFillColor(PRIO_COL.get(stats["priority"], ZINC500))
+                c.roundRect(W - M - bw, H - 47, bw, 24, 12, fill=1, stroke=0)
+                c.setFillColor(WHITE)
+                c.setFont("Helvetica-Bold", 10)
+                c.drawCentredString(W - M - bw / 2, H - 39, label)
+                c.setFont("Helvetica", 7.5)
+                c.setFillColor(ZINC500)
+                c.drawString(M, 24, "Dihasilkan otomatis dari citra satelit - estimasi awal, wajib verifikasi lapangan.")
+                c.drawRightString(W - M, 24, f"Halaman {page_state['n']}")
+                return H - 92
 
-            # Teks laporan AI
-            c.showPage()
-            y = height - 50
-            c.setFont("Helvetica-Bold", 11)
-            c.drawString(50, y, "AI Report (RAG-Grounded):")
-            y -= 18
+            def card(x, y_top, w, h, label, value):
+                c.setFillColor(WHITE)
+                c.setStrokeColor(ZINC200)
+                c.roundRect(x, y_top - h, w, h, 6, fill=1, stroke=1)
+                c.setFillColor(ZINC500)
+                c.setFont("Helvetica", 7)
+                c.drawString(x + 10, y_top - 15, str(label).upper())
+                c.setFillColor(ZINC900)
+                c.setFont("Helvetica-Bold", 13)
+                c.drawString(x + 10, y_top - h + 11, str(value))
+
+            def section(y, text):
+                c.setFillColor(ZINC900)
+                c.setFont("Helvetica-Bold", 11)
+                c.drawString(M, y, text)
+                c.setStrokeColor(ZINC200)
+                c.line(M, y - 7, W - M, y - 7)
+                return y - 24
+
+            y = new_page()
+
+            gap = 10
+            cw = (W - 2 * M - 3 * gap) / 4
+            rows = [
+                [("Damage", f"{stats['damage_percentage']}%"),
+                 ("Bangunan total", stats.get("buildings_total", "N/A")),
+                 ("Bangunan rusak", stats.get("buildings_damaged", "N/A")),
+                 ("Bangunan aman", stats.get("buildings_safe", "N/A"))],
+                [("Luas area", f"{stats.get('area_m2', 'N/A')} m2"),
+                 ("Confidence", confidence_pct),
+                 ("Radius evakuasi", f"{stats['evacuation_radius_km']} km"),
+                 ("Piksel rusak", f"{stats['damaged_pixels']:,}")],
+            ]
+            for row in rows:
+                for i, (lab, val) in enumerate(row):
+                    card(M + i * (cw + gap), y, cw, 46, lab, val)
+                y -= 46 + gap
+            y -= 14
+
+            y = section(y, "Decision Support")
+            c.setFillColor(ZINC900)
+            c.setFont("Helvetica", 9.5)
+            c.drawString(M, y, f"Aksi: {stats['recommended_action']}")
+            y -= 14
+            c.drawString(M, y, "Logistik: " + ", ".join(stats.get("required_logistics", [])))
+            y -= 26
+
+            top_locs = [l for l in stats.get("damaged_building_locations", []) if "lat" in l][:5]
+            if top_locs:
+                y = section(y, "Titik Prioritas Tim Lapangan")
+                c.setFont("Helvetica", 9)
+                for i, l in enumerate(top_locs, 1):
+                    c.setFillColor(ZINC900)
+                    c.drawString(M, y, f"{i}. {l['lat']}, {l['lon']}   (~{l['area_m2']} m2)")
+                    y -= 13
+                y -= 14
+
+            y = section(y, "Visual")
+            images_to_embed = [("Pre-disaster", pre_bytes), ("Post-disaster", post_bytes)]
+            for key, lab in [("mask_pre", "Predicted Mask (Pre)"), ("mask_post", "Predicted Mask (Post)"),
+                             ("difference_map", "Difference Map")]:
+                if key in result:
+                    images_to_embed.append((lab, b64_to_bytes(result[key])))
+
+            img_w = (W - 2 * M - 16) / 2
+            img_h = 150
+            col = 0
+            for label, img_bytes in images_to_embed:
+                if y - img_h - 18 < 40:
+                    y = new_page(" (lanjutan)")
+                    col = 0
+                x = M + col * (img_w + 16)
+                try:
+                    c.drawImage(ImageReader(io.BytesIO(img_bytes)), x, y - img_h, width=img_w, height=img_h,
+                                preserveAspectRatio=True, anchor="c")
+                    c.setStrokeColor(ZINC200)
+                    c.rect(x, y - img_h, img_w, img_h, fill=0, stroke=1)
+                    c.setFillColor(ZINC500)
+                    c.setFont("Helvetica", 8)
+                    c.drawString(x, y - img_h - 11, label)
+                except Exception:
+                    c.setFillColor(ZINC500)
+                    c.drawString(x, y - 12, f"[Gagal render gambar: {label}]")
+                col += 1
+                if col == 2:
+                    col = 0
+                    y -= img_h + 26
+
+            y = new_page(" - Laporan AI")
+            y = section(y, "AI Report (RAG-Grounded)")
+            c.setFillColor(ZINC900)
             c.setFont("Helvetica", 9)
-            for raw_line in stats.get("ai_report", "").split("\n"):
-                wrapped_lines = [raw_line[i:i + 100] for i in range(0, max(len(raw_line), 1), 100)] or [""]
+            clean_report = re.sub(r"[*#`]+", "", stats.get("ai_report", "Report not available."))
+            for raw_line in clean_report.split("\n"):
+                wrapped_lines = [raw_line[i:i + 105] for i in range(0, max(len(raw_line), 1), 105)] or [""]
                 for wrapped in wrapped_lines:
-                    c.drawString(50, y, wrapped)
+                    c.drawString(M, y, wrapped)
                     y -= 12
-                    if y < 60:
-                        c.showPage()
-                        y = height - 50
+                    if y < 44:
+                        y = new_page(" - Laporan AI")
+                        c.setFillColor(ZINC900)
+                        c.setFont("Helvetica", 9)
 
             c.save()
             buf.seek(0)
