@@ -9,10 +9,7 @@ from datetime import datetime
 import requests
 import streamlit as st
 from PIL import Image
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.utils import ImageReader
-from reportlab.pdfgen import canvas as rl_canvas
-from reportlab.lib.colors import HexColor
+from report_pdf import build_pdf
 
 # WAJIB jadi command Streamlit pertama — bahkan akses st.secrets di bawah pun dihitung command.
 st.set_page_config(page_title="Post-Disaster Damage Assessment", layout="wide")
@@ -517,156 +514,12 @@ if pre_bytes and post_bytes:
         # 9) Download PDF
         st.header("Download PDF")
 
-        def build_pdf_with_images():
-            ZINC900 = HexColor("#18181b")
-            ZINC500 = HexColor("#71717a")
-            ZINC300 = HexColor("#a1a1aa")
-            ZINC200 = HexColor("#e4e4e7")
-            WHITE = HexColor("#ffffff")
-            PRIO_COL = {"GREEN": HexColor("#16a34a"), "YELLOW": HexColor("#ca8a04"),
-                        "ORANGE": HexColor("#ea580c"), "RED": HexColor("#dc2626")}
-
-            buf = io.BytesIO()
-            c = rl_canvas.Canvas(buf, pagesize=A4)
-            W, H = A4
-            M = 40
-            page_state = {"n": 0}
-
-            def new_page(suffix=""):
-                if page_state["n"] > 0:
-                    c.showPage()
-                page_state["n"] += 1
-                c.setFillColor(ZINC900)
-                c.rect(0, H - 70, W, 70, fill=1, stroke=0)
-                c.setFillColor(WHITE)
-                c.setFont("Helvetica-Bold", 14)
-                c.drawString(M, H - 36, "Laporan Penilaian Kerusakan Pasca-Bencana" + suffix)
-                sub = "  |  ".join(str(x) for x in [stats.get("disaster_type"), stats.get("location"),
-                                                    datetime.now().strftime("%d %b %Y %H:%M")] if x)
-                c.setFillColor(ZINC300)
-                c.setFont("Helvetica", 8.5)
-                c.drawString(M, H - 52, sub)
-                label = f"{stats['priority']}  {stats['damage_percentage']}%"
-                bw = c.stringWidth(label, "Helvetica-Bold", 10) + 22
-                c.setFillColor(PRIO_COL.get(stats["priority"], ZINC500))
-                c.roundRect(W - M - bw, H - 47, bw, 24, 12, fill=1, stroke=0)
-                c.setFillColor(WHITE)
-                c.setFont("Helvetica-Bold", 10)
-                c.drawCentredString(W - M - bw / 2, H - 39, label)
-                c.setFont("Helvetica", 7.5)
-                c.setFillColor(ZINC500)
-                c.drawString(M, 24, "Dihasilkan otomatis dari citra satelit - estimasi awal, wajib verifikasi lapangan.")
-                c.drawRightString(W - M, 24, f"Halaman {page_state['n']}")
-                return H - 92
-
-            def card(x, y_top, w, h, label, value):
-                c.setFillColor(WHITE)
-                c.setStrokeColor(ZINC200)
-                c.roundRect(x, y_top - h, w, h, 6, fill=1, stroke=1)
-                c.setFillColor(ZINC500)
-                c.setFont("Helvetica", 7)
-                c.drawString(x + 10, y_top - 15, str(label).upper())
-                c.setFillColor(ZINC900)
-                c.setFont("Helvetica-Bold", 13)
-                c.drawString(x + 10, y_top - h + 11, str(value))
-
-            def section(y, text):
-                c.setFillColor(ZINC900)
-                c.setFont("Helvetica-Bold", 11)
-                c.drawString(M, y, text)
-                c.setStrokeColor(ZINC200)
-                c.line(M, y - 7, W - M, y - 7)
-                return y - 24
-
-            y = new_page()
-
-            gap = 10
-            cw = (W - 2 * M - 3 * gap) / 4
-            rows = [
-                [("Damage", f"{stats['damage_percentage']}%"),
-                 ("Bangunan total", stats.get("buildings_total", "N/A")),
-                 ("Bangunan rusak", stats.get("buildings_damaged", "N/A")),
-                 ("Bangunan aman", stats.get("buildings_safe", "N/A"))],
-                [("Luas area", f"{stats.get('area_m2', 'N/A')} m2"),
-                 ("Confidence", confidence_pct),
-                 ("Radius evakuasi", f"{stats['evacuation_radius_km']} km"),
-                 ("Piksel rusak", f"{stats['damaged_pixels']:,}")],
-            ]
-            for row in rows:
-                for i, (lab, val) in enumerate(row):
-                    card(M + i * (cw + gap), y, cw, 46, lab, val)
-                y -= 46 + gap
-            y -= 14
-
-            y = section(y, "Decision Support")
-            c.setFillColor(ZINC900)
-            c.setFont("Helvetica", 9.5)
-            c.drawString(M, y, f"Aksi: {stats['recommended_action']}")
-            y -= 14
-            c.drawString(M, y, "Logistik: " + ", ".join(stats.get("required_logistics", [])))
-            y -= 26
-
-            top_locs = [l for l in stats.get("damaged_building_locations", []) if "lat" in l][:5]
-            if top_locs:
-                y = section(y, "Titik Prioritas Tim Lapangan")
-                c.setFont("Helvetica", 9)
-                for i, l in enumerate(top_locs, 1):
-                    c.setFillColor(ZINC900)
-                    c.drawString(M, y, f"{i}. {l['lat']}, {l['lon']}   (~{l['area_m2']} m2)")
-                    y -= 13
-                y -= 14
-
-            y = section(y, "Visual")
-            images_to_embed = [("Pre-disaster", pre_bytes), ("Post-disaster", post_bytes)]
-            for key, lab in [("mask_pre", "Predicted Mask (Pre)"), ("mask_post", "Predicted Mask (Post)"),
-                             ("difference_map", "Difference Map")]:
-                if key in result:
-                    images_to_embed.append((lab, b64_to_bytes(result[key])))
-
-            img_w = (W - 2 * M - 16) / 2
-            img_h = 150
-            col = 0
-            for label, img_bytes in images_to_embed:
-                if y - img_h - 18 < 40:
-                    y = new_page(" (lanjutan)")
-                    col = 0
-                x = M + col * (img_w + 16)
-                try:
-                    c.drawImage(ImageReader(io.BytesIO(img_bytes)), x, y - img_h, width=img_w, height=img_h,
-                                preserveAspectRatio=True, anchor="c")
-                    c.setStrokeColor(ZINC200)
-                    c.rect(x, y - img_h, img_w, img_h, fill=0, stroke=1)
-                    c.setFillColor(ZINC500)
-                    c.setFont("Helvetica", 8)
-                    c.drawString(x, y - img_h - 11, label)
-                except Exception:
-                    c.setFillColor(ZINC500)
-                    c.drawString(x, y - 12, f"[Gagal render gambar: {label}]")
-                col += 1
-                if col == 2:
-                    col = 0
-                    y -= img_h + 26
-
-            y = new_page(" - Laporan AI")
-            y = section(y, "AI Report (RAG-Grounded)")
-            c.setFillColor(ZINC900)
-            c.setFont("Helvetica", 9)
-            clean_report = re.sub(r"[*#`]+", "", stats.get("ai_report", "Report not available."))
-            for raw_line in clean_report.split("\n"):
-                wrapped_lines = [raw_line[i:i + 105] for i in range(0, max(len(raw_line), 1), 105)] or [""]
-                for wrapped in wrapped_lines:
-                    c.drawString(M, y, wrapped)
-                    y -= 12
-                    if y < 44:
-                        y = new_page(" - Laporan AI")
-                        c.setFillColor(ZINC900)
-                        c.setFont("Helvetica", 9)
-
-            c.save()
-            buf.seek(0)
-            return buf
-
-        pdf_buf = build_pdf_with_images()
+        pdf_images = [("Pre-disaster", pre_bytes), ("Post-disaster", post_bytes)]
+        for key, lab in [("mask_pre", "Segmentasi (Pre)"), ("mask_post", "Segmentasi (Post)"),
+                         ("difference_map", "Difference Map")]:
+            if key in result:
+                pdf_images.append((lab, b64_to_bytes(result[key])))
+        pdf_buf = build_pdf(stats, pdf_images, confidence_pct)
         d1, d2 = st.columns(2)
         d1.download_button("Download Report as PDF", data=pdf_buf,
                            file_name="damage_report.pdf", mime="application/pdf")
