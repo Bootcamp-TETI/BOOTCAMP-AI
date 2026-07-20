@@ -190,6 +190,35 @@ def geocode_place(place: str):
     return None
 
 
+def parse_xbd_label(label_bytes: bytes, img_w: int, img_h: int):
+    """Hitung (lat, lon, gsd) pusat citra dari file label xBD — label menyimpan polygon
+    dalam ruang piksel (xy) dan geografis (lng_lat), jadi pemetaan liniernya bisa
+    diturunkan untuk tile xBD MANA PUN, bukan cuma sample bawaan."""
+    try:
+        import math
+        d = json.loads(label_bytes)
+        fx = d.get("features", {}).get("xy", [])
+        fl = d.get("features", {}).get("lng_lat", [])
+        if not fx or not fl:
+            return None
+        xs, ys, lons, lats = [], [], [], []
+        for f_xy, f_ll in zip(fx, fl):
+            for a, b in re.findall(r"([\-0-9.]+) ([\-0-9.]+)", f_xy.get("wkt", "")):
+                xs.append(float(a)); ys.append(float(b))
+            for a, b in re.findall(r"([\-0-9.]+) ([\-0-9.]+)", f_ll.get("wkt", "")):
+                lons.append(float(a)); lats.append(float(b))
+        if len(set(xs)) < 2 or len(set(ys)) < 2:
+            return None
+        sx = (max(lons) - min(lons)) / (max(xs) - min(xs))
+        sy = (max(lats) - min(lats)) / (max(ys) - min(ys))
+        lon_c = min(lons) + (img_w / 2 - min(xs)) * sx
+        lat_c = max(lats) - (img_h / 2 - min(ys)) * sy
+        gsd = round((sx * 111320 * abs(math.cos(math.radians(lat_c))) + sy * 111320) / 2, 3)
+        return lat_c, lon_c, gsd
+    except Exception:
+        return None
+
+
 def exif_gps(img_bytes: bytes):
     """Baca koordinat GPS dari metadata EXIF (umumnya ada di foto kamera/drone;
     citra satelit PNG seperti xBD tidak punya — fallback ke input manual)."""
@@ -272,8 +301,13 @@ if pre_bytes and post_bytes:
     # Koordinat diisi otomatis, urut akurasi: metadata sample xBD > EXIF gambar > geocode nama lokasi.
     # Field manual tetap ada sebagai override.
     sample_meta = st.session_state.get("sample_meta") or {}
-    gps, gps_src = None, None
-    if sample_meta.get("coords"):
+    gps, gps_src, label_gsd = None, None, None
+    if label_file is not None:
+        parsed = parse_xbd_label(label_file.getvalue(), pre_size[0], pre_size[1])
+        if parsed:
+            gps, gps_src = (parsed[0], parsed[1]), "label xBD yang di-upload (akurat)"
+            label_gsd = parsed[2]
+    if not gps and sample_meta.get("coords"):
         gps, gps_src = sample_meta["coords"], "georeference label xBD (akurat)"
     if not gps:
         gps, gps_src = exif_gps(post_bytes) or exif_gps(pre_bytes), "metadata EXIF gambar"
@@ -281,6 +315,8 @@ if pre_bytes and post_bytes:
         gps, gps_src = geocode_place(location), (f'nama lokasi "{location}" via OpenStreetMap — '
                                                  "perkiraan pusat wilayah, titik bangunan akurat "
                                                  "secara RELATIF saja")
+    label_file = st.file_uploader("Opsional: file label xBD (.json) — georeference otomatis untuk tile xBD mana pun",
+                                  type=["json"], key="xbdlabel")
     center_lat = cc3.text_input("Latitude pusat citra",
                                 value=(f"{gps[0]:.6f}" if gps else ""), placeholder="-0.8917")
     center_lon = cc4.text_input("Longitude pusat citra",
@@ -302,7 +338,9 @@ if pre_bytes and post_bytes:
             form_data["center_lon"] = float(center_lon)
         except ValueError:
             pass  # lat/lon kosong/tidak valid — analisis tetap jalan tanpa koordinat
-        if sample_meta.get("gsd"):
+        if label_gsd:
+            form_data["gsd"] = label_gsd
+        elif sample_meta.get("gsd"):
             form_data["gsd"] = sample_meta["gsd"]
 
         with st.status("Menjalankan analisis...", expanded=True) as status:
