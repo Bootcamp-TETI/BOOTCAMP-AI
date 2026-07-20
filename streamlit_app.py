@@ -300,6 +300,8 @@ if pre_bytes and post_bytes:
                                   ["", "Tsunami", "Gempa bumi", "Banjir", "Tanah longsor", "Erupsi gunung api", "Lainnya"])
     # Koordinat diisi otomatis, urut akurasi: metadata sample xBD > EXIF gambar > geocode nama lokasi.
     # Field manual tetap ada sebagai override.
+    label_file = st.file_uploader("Opsional: file label xBD (.json) — georeference otomatis untuk tile xBD mana pun",
+                                  type=["json"], key="xbdlabel")
     sample_meta = st.session_state.get("sample_meta") or {}
     gps, gps_src, label_gsd = None, None, None
     if label_file is not None:
@@ -315,8 +317,6 @@ if pre_bytes and post_bytes:
         gps, gps_src = geocode_place(location), (f'nama lokasi "{location}" via OpenStreetMap — '
                                                  "perkiraan pusat wilayah, titik bangunan akurat "
                                                  "secara RELATIF saja")
-    label_file = st.file_uploader("Opsional: file label xBD (.json) — georeference otomatis untuk tile xBD mana pun",
-                                  type=["json"], key="xbdlabel")
     center_lat = cc3.text_input("Latitude pusat citra",
                                 value=(f"{gps[0]:.6f}" if gps else ""), placeholder="-0.8917")
     center_lon = cc4.text_input("Longitude pusat citra",
